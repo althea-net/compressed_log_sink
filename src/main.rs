@@ -11,7 +11,7 @@ use std::io;
 
 /// Define http actor
 struct Ws {
-    write: Box<io::Write>,
+    write: Box<dyn io::Write>,
 }
 
 impl Default for Ws {
@@ -23,7 +23,7 @@ impl Default for Ws {
 }
 
 impl Ws {
-    pub fn new(write: Box<io::Write>) -> Self {
+    pub fn new(write: Box<dyn io::Write>) -> Self {
         Self { write }
     }
 }
@@ -109,7 +109,7 @@ fn main() {
                     info!("Somone hit sink!");
 
                     // Create a stream with given options
-                    let stream: Box<io::Write> = if output.clone() == "-" {
+                    let stream: Box<dyn io::Write> = if output.clone() == "-" {
                         Box::new(io::stdout())
                     } else {
                         // Try to open a file, or fallback to stdout.
