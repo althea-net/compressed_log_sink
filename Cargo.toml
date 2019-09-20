@@ -5,9 +5,9 @@ authors = ["Michał Papierski <michal@papierski.net>"]
 edition = "2018"
 
 [dependencies]
-actix = "0.7.9"
-actix-web = { version = "0.7.16", features = ["ssl"] }
-futures = "0.1.25"
+actix = "0.7"
+actix-web = { version = "0.7", features = ["ssl"] }
+futures = "0.1"
 lz4 = "1.23.1"
 docopt = "1"
 serde = "1.0"
