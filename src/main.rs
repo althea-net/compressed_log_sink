@@ -15,6 +15,7 @@ use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 use serde_json;
 use std::fs::OpenOptions;
 use std::io;
+use std::io::Write;
 use std::net::SocketAddr;
 use tokio::io::write_all;
 use tokio::net::TcpStream;
@@ -34,7 +35,6 @@ fn handle_log_payload(
     value: Json<PlaintextLogs>,
 ) -> Box<dyn Future<Item = HttpResponse, Error = Error>> {
     let logs = value.into_inner().logs;
-    println!("Got logs {:?}", logs);
     output_logs(logs)
 }
 
@@ -49,11 +49,6 @@ fn handle_compressed_log_payload(
     io::copy(&mut decoder, &mut ret).expect("Unable to copy data from decoder to output buffer");
     let plaintext_logs: PlaintextLogs =
         serde_json::from_slice(&ret).expect("Failed to decompress!");
-    println!(
-        "Got compressed  {} bytes of logs {:?}",
-        bytes.len(),
-        plaintext_logs.logs
-    );
     output_logs(plaintext_logs.logs)
 }
 
@@ -93,11 +88,17 @@ fn create_output_file() {
     }
 }
 
+/// Dumb helper function to make sure the tcp socket arg is valid
+fn check_tcp_arg() {
+    if let DestinationType::TCPStream { url } = get_destination_details() {
+        let _s: SocketAddr = url.parse().expect(&format!("{} is not a valid SocketAddr", url));
+    }
+}
+
 fn log_to_bytes(logs: Vec<String>) -> Vec<u8> {
     let mut bytes: Vec<u8> = Vec::new();
     for log in logs {
         bytes.extend(log.into_bytes());
-        bytes.extend(b"\n");
     }
     bytes
 }
@@ -115,19 +116,22 @@ fn output_logs(logs: Vec<String>) -> Box<dyn Future<Item = HttpResponse, Error =
         }
         DestinationType::File { path } => {
             let bytes = log_to_bytes(logs);
-            Box::new(
-                tokio::fs::File::open(path)
-                    .from_err()
-                    .and_then(move |file| {
-                        write_all(file, bytes)
-                            .from_err()
-                            .and_then(|_res| Ok(HttpResponse::Ok().json(())))
-                    }),
-            )
+            info!("Dumping {} bytes of logs to {}", bytes.len(), path);
+            let mut options = OpenOptions::new();
+            let mut file = options
+                .append(true)
+                .open(path)
+                .expect("Failed to open file for append");
+            let res = file.write(&bytes);
+            if res.is_err() {
+                return Box::new(future::ok(HttpResponse::InternalServerError().json(())));
+            }
+            Box::new(future::ok(HttpResponse::Ok().json(())))
         }
         DestinationType::TCPStream { url } => {
             let bytes = log_to_bytes(logs);
             let socket: SocketAddr = url.parse().expect("Invalid tcp sink socket");
+            info!("Dumping {} bytes of logs to {}", bytes.len(), url);
             Box::new(
                 TcpStream::connect(&socket)
                     .from_err()
@@ -184,6 +188,7 @@ fn main() {
     env_logger::init();
     info!("Compressed log sink starting!");
     create_output_file();
+    check_tcp_arg();
 
     let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
     builder
@@ -211,5 +216,6 @@ fn main() {
     })
     .bind_ssl(&ARGS.flag_bind, builder)
     .unwrap_or_else(|_| panic!("Unable to bind to {}", ARGS.flag_bind))
+    .workers(20)
     .run();
 }
