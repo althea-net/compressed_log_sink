@@ -1,78 +1,169 @@
 #[macro_use]
 extern crate log;
-extern crate env_logger;
+#[macro_use]
 extern crate serde_derive;
-use actix::*;
-use actix_web::{server, ws, App};
-use lz4::Decoder;
+#[macro_use]
+extern crate lazy_static;
+extern crate env_logger;
+use actix_web::http::Method;
+use actix_web::Error;
+use actix_web::{server, App, HttpResponse, Json};
+use flate2::read::ZlibDecoder;
+use futures::future;
+use futures::Future;
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
+use serde_json;
 use std::fs::OpenOptions;
 use std::io;
+use std::net::SocketAddr;
+use tokio::io::write_all;
+use tokio::net::TcpStream;
 
-/// Define http actor
-struct Ws {
-    write: Box<dyn io::Write>,
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct PlaintextLogs {
+    logs: Vec<String>,
 }
 
-impl Default for Ws {
-    fn default() -> Self {
-        Self {
-            write: Box::new(io::stdout()),
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct CompressedLogs {
+    compressed_plaintext_logs: Vec<u8>,
+}
+
+/// Handler for requests
+fn handle_log_payload(
+    value: Json<PlaintextLogs>,
+) -> Box<dyn Future<Item = HttpResponse, Error = Error>> {
+    let logs = value.into_inner().logs;
+    println!("Got logs {:?}", logs);
+    output_logs(logs)
+}
+
+/// Handler for requests
+fn handle_compressed_log_payload(
+    value: Json<CompressedLogs>,
+) -> Box<dyn Future<Item = HttpResponse, Error = Error>> {
+    let bytes = value.into_inner().compressed_plaintext_logs;
+    let mut decoder = ZlibDecoder::new(&bytes[..]);
+    let mut ret = Vec::new();
+    // Extract data from decoder
+    io::copy(&mut decoder, &mut ret).expect("Unable to copy data from decoder to output buffer");
+    let plaintext_logs: PlaintextLogs =
+        serde_json::from_slice(&ret).expect("Failed to decompress!");
+    println!(
+        "Got compressed  {} bytes of logs {:?}",
+        bytes.len(),
+        plaintext_logs.logs
+    );
+    output_logs(plaintext_logs.logs)
+}
+
+/// Enum of possible log output destinations
+pub enum DestinationType {
+    StdOut,
+    TCPStream { url: String },
+    File { path: String },
+}
+
+/// Helper function for converting the destination argument string into a DestinationType enum
+/// value
+fn get_destination_details() -> DestinationType {
+    match ARGS.flag_output.clone() {
+        Some(destination) => {
+            if destination.contains(":") && !destination.starts_with("/") {
+                DestinationType::TCPStream { url: destination }
+            } else if destination == "-" {
+                DestinationType::StdOut
+            } else {
+                DestinationType::File { path: destination }
+            }
         }
+        None => DestinationType::StdOut,
     }
 }
 
-impl Ws {
-    pub fn new(write: Box<dyn io::Write>) -> Self {
-        Self { write }
+/// Dumb helper function to make sure the file exists so that we don't have to check
+/// for that before appending to it later on
+fn create_output_file() {
+    if let DestinationType::File { path } = get_destination_details() {
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(&path)
+            .expect(&format!("Failed to create output file! {}", path));
     }
 }
 
-impl Actor for Ws {
-    type Context = ws::WebsocketContext<Self>;
+fn log_to_bytes(logs: Vec<String>) -> Vec<u8> {
+    let mut bytes: Vec<u8> = Vec::new();
+    for log in logs {
+        bytes.extend(log.into_bytes());
+        bytes.extend(b"\n");
+    }
+    bytes
 }
 
-/// Handler for ws::Message message
-impl StreamHandler<ws::Message, ws::ProtocolError> for Ws {
-    fn handle(&mut self, msg: ws::Message, ctx: &mut Self::Context) {
-        match msg {
-            ws::Message::Ping(msg) => {
-                debug!("Got ping, responding with pong");
-                ctx.pong(&msg)
+/// Takes the raw log lines from log input handlers and puts them out on the correct output
+/// The options for output are either - for stdout, a file path, or a url for direct tcp log dump
+fn output_logs(logs: Vec<String>) -> Box<dyn Future<Item = HttpResponse, Error = Error>> {
+    let destination = get_destination_details();
+    match destination {
+        DestinationType::StdOut => {
+            for log in logs {
+                println!("{}", log);
             }
-            ws::Message::Text(_text) => (),
-            ws::Message::Binary(mut bin) => {
-                debug!("Got binary, dumping");
-                let bytes = bin.take().to_vec();
-                let mut decoder = Decoder::new(&bytes[..]).expect("Unable to create decoder");
-                let mut output = Vec::new();
-                // Extract data from decoder
-                io::copy(&mut decoder, &mut output)
-                    .expect("Unable to copy data from decoder to output buffer");
-
-                // Don't fail if the data can't be written to the output stream
-                println!("Write data to a stream... {} bytes", output.len());
-                if let Err(err) = self.write.write(&output) {
-                    eprintln!("Unable to write data to a stream: {}", err);
-                } else {
-                    // Otherwise flush the write.Actor
-                    // This should make multiple opened file streams
-                    // to not overleap their writes with others.
-                    let _ = self.write.flush();
-                }
-            }
-            _ => println!("Unknown message"),
+            Box::new(future::ok(HttpResponse::Ok().json(())))
+        }
+        DestinationType::File { path } => {
+            let bytes = log_to_bytes(logs);
+            Box::new(
+                tokio::fs::File::open(path)
+                    .from_err()
+                    .and_then(move |file| {
+                        write_all(file, bytes)
+                            .from_err()
+                            .and_then(|_res| Ok(HttpResponse::Ok().json(())))
+                    }),
+            )
+        }
+        DestinationType::TCPStream { url } => {
+            let bytes = log_to_bytes(logs);
+            let socket: SocketAddr = url.parse().expect("Invalid tcp sink socket");
+            Box::new(
+                TcpStream::connect(&socket)
+                    .from_err()
+                    .and_then(move |stream| {
+                        write_all(stream, bytes)
+                            .from_err()
+                            .and_then(|_res| Ok(HttpResponse::Ok().json(())))
+                    }),
+            )
         }
     }
 }
 
 use docopt::Docopt;
 
-const USAGE: &str = r#"
+#[derive(Debug, Deserialize, Default)]
+pub struct Args {
+    flag_bind: String,
+    flag_cert: String,
+    flag_key: String,
+    flag_output: Option<String>,
+}
+
+lazy_static! {
+    pub static ref ARGS: Args = Docopt::new((*USAGE).as_str())
+        .and_then(|d| d.deserialize())
+        .unwrap_or_else(|e| e.exit());
+}
+
+lazy_static! {
+    static ref USAGE: String = format!(
+        "
 Compressed log sink.
 
 Usage:
-  compressed_log_sink [ --bind=<address> ] [ --output=<stream> ] --cert=<cert-path> --key=<key-path>
+  compressed_log_sink --bind=<address> --cert=<cert-path> --key=<key-path> [ --output=<stream> ]
   compressed_log_sink (-h | --help)
   compressed_log_sink --version
 
@@ -83,55 +174,42 @@ Options:
   --output=<stream>  Output stream [default: stdout].
   --cert=<path>     Https certificate chain.
   --key=<path>     Https keyfile.
-"#;
+About:
+    Version {}",
+        env!("CARGO_PKG_VERSION"),
+    );
+}
 
 fn main() {
     env_logger::init();
     info!("Compressed log sink starting!");
-    let args = Docopt::new(USAGE)
-        .and_then(|d| d.parse())
-        .unwrap_or_else(|e| e.exit());
-    let output = args.get_str("--output").to_string();
+    create_output_file();
+
     let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
     builder
-        .set_private_key_file(args.get_str("--key"), SslFiletype::PEM)
+        .set_private_key_file(&ARGS.flag_key, SslFiletype::PEM)
         .expect("Invalid ssl private key! Please use PEM format");
     builder
-        .set_certificate_chain_file(args.get_str("--cert"))
+        .set_certificate_chain_file(&ARGS.flag_cert)
         .expect("Invalid ssl certificate! Please use PEM format");
 
     server::new(move || {
-        // Without this clone it fails miserably in nested closures
-        let output = output.clone();
         App::new()
-            .resource("/sink/", move |r| {
-                r.f(move |req| {
-                    info!("Somone hit sink!");
-
-                    // Create a stream with given options
-                    let stream: Box<dyn io::Write> = if output.clone() == "-" {
-                        Box::new(io::stdout())
-                    } else {
-                        // Try to open a file, or fallback to stdout.
-                        match OpenOptions::new()
-                            .write(true)
-                            .create(true)
-                            .append(true)
-                            .open(output.clone())
-                        {
-                            Ok(file) => Box::new(file),
-                            Err(e) => {
-                                eprintln!("Unable to open file for writing: {}...", e);
-                                Box::new(io::stdout())
-                            }
-                        }
-                    };
-                    ws::start(req, Ws::new(stream))
-                })
-            })
+            .route("/sink", Method::POST, handle_log_payload)
+            .route("/sink", Method::POST, handle_log_payload)
+            .route(
+                "/compressed_sink",
+                Method::POST,
+                handle_compressed_log_payload,
+            )
+            .route(
+                "/compressed_sink/",
+                Method::POST,
+                handle_compressed_log_payload,
+            )
             .finish()
     })
-    .bind_ssl(args.get_str("--bind"), builder)
-    .unwrap_or_else(|_| panic!("Unable to bind to {}", args.get_str("--bind")))
+    .bind_ssl(&ARGS.flag_bind, builder)
+    .unwrap_or_else(|_| panic!("Unable to bind to {}", ARGS.flag_bind))
     .run();
 }
