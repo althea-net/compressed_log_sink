@@ -19,6 +19,7 @@ use std::io::Write;
 use std::net::SocketAddr;
 use tokio::io::write_all;
 use tokio::net::TcpStream;
+use serde_json::Error as SerdeError;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct PlaintextLogs {
@@ -46,10 +47,18 @@ fn handle_compressed_log_payload(
     let mut decoder = ZlibDecoder::new(&bytes[..]);
     let mut ret = Vec::new();
     // Extract data from decoder
-    io::copy(&mut decoder, &mut ret).expect("Unable to copy data from decoder to output buffer");
-    let plaintext_logs: PlaintextLogs =
-        serde_json::from_slice(&ret).expect("Failed to decompress!");
-    output_logs(plaintext_logs.logs)
+    let res = io::copy(&mut decoder, &mut ret);
+    match res {
+        Ok(_) => {
+            let plaintext_logs: Result<PlaintextLogs, SerdeError> =
+                serde_json::from_slice(&ret);
+            match plaintext_logs {
+                Ok(pl) => output_logs(pl.logs),
+                Err(e) => {Box::new(future::err(e.into()))}
+            }
+        }
+        Err(e) => {Box::new(future::err(e.into()))}
+    }
 }
 
 /// Enum of possible log output destinations
@@ -91,7 +100,9 @@ fn create_output_file() {
 /// Dumb helper function to make sure the tcp socket arg is valid
 fn check_tcp_arg() {
     if let DestinationType::TCPStream { url } = get_destination_details() {
-        let _s: SocketAddr = url.parse().expect(&format!("{} is not a valid SocketAddr", url));
+        let _s: SocketAddr = url
+            .parse()
+            .expect(&format!("{} is not a valid SocketAddr", url));
     }
 }
 
@@ -216,6 +227,6 @@ fn main() {
     })
     .bind_ssl(&ARGS.flag_bind, builder)
     .unwrap_or_else(|_| panic!("Unable to bind to {}", ARGS.flag_bind))
-    .workers(20)
+    .workers(4)
     .run();
 }
