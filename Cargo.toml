@@ -18,3 +18,4 @@ openssl = "0.10"
 flate2 = { version = "1.0", features = ["rust_backend"], default-features = false }
 lazy_static = "1.4"
 tokio = "0.1"
+openssl-probe = "0.1"

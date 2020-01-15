@@ -197,6 +197,7 @@ About:
 
 fn main() {
     env_logger::init();
+    openssl_probe::init_ssl_cert_env_vars();
     info!("Compressed log sink starting!");
     create_output_file();
     check_tcp_arg();
