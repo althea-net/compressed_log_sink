@@ -5,17 +5,18 @@ authors = ["Michał Papierski <michal@papierski.net>"]
 edition = "2018"
 
 [dependencies]
-actix = "0.7"
-actix-web = { version = "0.7", features = ["ssl"] }
-futures = "0.1"
+actix-rt = "1"
+actix = "0.10"
+actix-web = { version = "3.3", features = ["rustls"] }
+futures = "0.3"
 docopt = "1"
 serde = "1.0"
 serde_derive = "1.0"
 serde_json = "1.0"
 log = "0.4"
-env_logger = "0.7"
-openssl = "0.10"
+env_logger = "0.8"
 flate2 = { version = "1.0", features = ["rust_backend"], default-features = false }
 lazy_static = "1.4"
-tokio = "0.1"
+tokio = {version = "0.3", features = ["net"]}
+rustls = "0.18"
 openssl-probe = "0.1"

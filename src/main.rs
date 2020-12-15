@@ -5,21 +5,21 @@ extern crate serde_derive;
 #[macro_use]
 extern crate lazy_static;
 extern crate env_logger;
-use actix_web::http::Method;
-use actix_web::Error;
-use actix_web::{server, App, HttpResponse, Json};
+use actix_web::post;
+use actix_web::{web::Json, Responder};
+use actix_web::{App, HttpResponse};
+use actix_web::{Error, HttpServer};
 use flate2::read::ZlibDecoder;
-use futures::future;
-use futures::Future;
-use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
-use serde_json;
-use std::fs::OpenOptions;
-use std::io;
+use rustls::{
+    internal::pemfile::{certs, pkcs8_private_keys},
+    NoClientAuth, ServerConfig,
+};
+use serde_json::Error as SerdeError;
 use std::io::Write;
 use std::net::SocketAddr;
-use tokio::io::write_all;
-use tokio::net::TcpStream;
-use serde_json::Error as SerdeError;
+use std::net::TcpStream;
+use std::{fs::File, io};
+use std::{fs::OpenOptions, io::BufReader};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct PlaintextLogs {
@@ -32,32 +32,29 @@ struct CompressedLogs {
 }
 
 /// Handler for requests
-fn handle_log_payload(
-    value: Json<PlaintextLogs>,
-) -> Box<dyn Future<Item = HttpResponse, Error = Error>> {
+#[post("/sink")]
+async fn handle_log_payload(value: Json<PlaintextLogs>) -> impl Responder {
     let logs = value.into_inner().logs;
-    output_logs(logs)
+    output_logs(logs).await
 }
 
 /// Handler for requests
-fn handle_compressed_log_payload(
-    value: Json<CompressedLogs>,
-) -> Box<dyn Future<Item = HttpResponse, Error = Error>> {
-    let bytes = value.into_inner().compressed_plaintext_logs;
+#[post("/compressed_sink")]
+async fn handle_compressed_log_payload(request: Json<CompressedLogs>) -> impl Responder {
+    let bytes = request.into_inner().compressed_plaintext_logs;
     let mut decoder = ZlibDecoder::new(&bytes[..]);
     let mut ret = Vec::new();
     // Extract data from decoder
     let res = io::copy(&mut decoder, &mut ret);
     match res {
         Ok(_) => {
-            let plaintext_logs: Result<PlaintextLogs, SerdeError> =
-                serde_json::from_slice(&ret);
+            let plaintext_logs: Result<PlaintextLogs, SerdeError> = serde_json::from_slice(&ret);
             match plaintext_logs {
-                Ok(pl) => output_logs(pl.logs),
-                Err(e) => {Box::new(future::err(e.into()))}
+                Ok(pl) => output_logs(pl.logs).await,
+                Err(e) => Err(e.into()),
             }
         }
-        Err(e) => {Box::new(future::err(e.into()))}
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -73,7 +70,7 @@ pub enum DestinationType {
 fn get_destination_details() -> DestinationType {
     match ARGS.flag_output.clone() {
         Some(destination) => {
-            if destination.contains(":") && !destination.starts_with("/") {
+            if destination.contains(':') && !destination.starts_with('/') {
                 DestinationType::TCPStream { url: destination }
             } else if destination == "-" {
                 DestinationType::StdOut
@@ -93,7 +90,7 @@ fn create_output_file() {
             .write(true)
             .create(true)
             .open(&path)
-            .expect(&format!("Failed to create output file! {}", path));
+            .unwrap_or_else(|_| panic!("Failed to create output file! {}", path));
     }
 }
 
@@ -102,7 +99,7 @@ fn check_tcp_arg() {
     if let DestinationType::TCPStream { url } = get_destination_details() {
         let _s: SocketAddr = url
             .parse()
-            .expect(&format!("{} is not a valid SocketAddr", url));
+            .unwrap_or_else(|_| panic!("{} is not a valid SocketAddr", url));
     }
 }
 
@@ -116,14 +113,14 @@ fn log_to_bytes(logs: Vec<String>) -> Vec<u8> {
 
 /// Takes the raw log lines from log input handlers and puts them out on the correct output
 /// The options for output are either - for stdout, a file path, or a url for direct tcp log dump
-fn output_logs(logs: Vec<String>) -> Box<dyn Future<Item = HttpResponse, Error = Error>> {
+async fn output_logs(logs: Vec<String>) -> Result<HttpResponse, Error> {
     let destination = get_destination_details();
     match destination {
         DestinationType::StdOut => {
             for log in logs {
                 println!("{}", log);
             }
-            Box::new(future::ok(HttpResponse::Ok().json(())))
+            Ok(HttpResponse::Ok().json(()))
         }
         DestinationType::File { path } => {
             let bytes = log_to_bytes(logs);
@@ -135,23 +132,18 @@ fn output_logs(logs: Vec<String>) -> Box<dyn Future<Item = HttpResponse, Error =
                 .expect("Failed to open file for append");
             let res = file.write(&bytes);
             if res.is_err() {
-                return Box::new(future::ok(HttpResponse::InternalServerError().json(())));
+                return Ok(HttpResponse::InternalServerError().json(()));
             }
-            Box::new(future::ok(HttpResponse::Ok().json(())))
+            Ok(HttpResponse::Ok().json(()))
         }
         DestinationType::TCPStream { url } => {
             let bytes = log_to_bytes(logs);
             let socket: SocketAddr = url.parse().expect("Invalid tcp sink socket");
             info!("Dumping {} bytes of logs to {}", bytes.len(), url);
-            Box::new(
-                TcpStream::connect(&socket)
-                    .from_err()
-                    .and_then(move |stream| {
-                        write_all(stream, bytes)
-                            .from_err()
-                            .and_then(|_res| Ok(HttpResponse::Ok().json(())))
-                    }),
-            )
+
+            let mut stream = TcpStream::connect(&socket)?;
+            let _ = stream.write_all(&bytes);
+            Ok(HttpResponse::Ok().json(()))
         }
     }
 }
@@ -195,39 +187,33 @@ About:
     );
 }
 
-fn main() {
+#[actix_rt::main]
+async fn main() -> std::io::Result<()> {
     env_logger::init();
     openssl_probe::init_ssl_cert_env_vars();
     info!("Compressed log sink starting!");
     create_output_file();
     check_tcp_arg();
 
-    let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
-    builder
-        .set_private_key_file(&ARGS.flag_key, SslFiletype::PEM)
-        .expect("Invalid ssl private key! Please use PEM format");
-    builder
-        .set_certificate_chain_file(&ARGS.flag_cert)
-        .expect("Invalid ssl certificate! Please use PEM format");
+    let mut config = ServerConfig::new(NoClientAuth::new());
+    let cert_file = &mut BufReader::new(
+        File::open(&ARGS.flag_cert).expect("Invalid ssl certificate! Please use PEM format"),
+    );
+    let key_file = &mut BufReader::new(
+        File::open(&ARGS.flag_key).expect("Invalid ssl private key! Please use PEM format"),
+    );
+    let cert_chain = certs(cert_file).unwrap();
+    let mut keys = pkcs8_private_keys(key_file).unwrap();
+    config.set_single_cert(cert_chain, keys.remove(0)).unwrap();
 
-    server::new(move || {
+    HttpServer::new(move || {
         App::new()
-            .route("/sink", Method::POST, handle_log_payload)
-            .route("/sink", Method::POST, handle_log_payload)
-            .route(
-                "/compressed_sink",
-                Method::POST,
-                handle_compressed_log_payload,
-            )
-            .route(
-                "/compressed_sink/",
-                Method::POST,
-                handle_compressed_log_payload,
-            )
-            .finish()
+            .service(handle_log_payload)
+            .service(handle_compressed_log_payload)
     })
-    .bind_ssl(&ARGS.flag_bind, builder)
-    .unwrap_or_else(|_| panic!("Unable to bind to {}", ARGS.flag_bind))
+    .bind_rustls(&ARGS.flag_bind, config)?
     .workers(4)
-    .run();
+    .run()
+    .await?;
+    Ok(())
 }
