@@ -5,7 +5,9 @@ extern crate serde_derive;
 #[macro_use]
 extern crate lazy_static;
 extern crate env_logger;
+use actix_web::error::InternalError;
 use actix_web::post;
+use actix_web::web::JsonConfig;
 use actix_web::{web::Json, Responder};
 use actix_web::{App, HttpResponse};
 use actix_web::{Error, HttpServer};
@@ -51,7 +53,10 @@ async fn handle_compressed_log_payload(request: Json<CompressedLogs>) -> impl Re
             let plaintext_logs: Result<PlaintextLogs, SerdeError> = serde_json::from_slice(&ret);
             match plaintext_logs {
                 Ok(pl) => output_logs(pl.logs).await,
-                Err(e) => Err(e.into()),
+                Err(e) => {
+                    error!("Failed to extract logs {:?}", e);
+                    Ok(HttpResponse::BadRequest().json("Failed to decompress!"))
+                }
             }
         }
         Err(e) => Err(e.into()),
@@ -206,13 +211,25 @@ async fn main() -> std::io::Result<()> {
     let mut keys = pkcs8_private_keys(key_file).unwrap();
     config.set_single_cert(cert_chain, keys.remove(0)).unwrap();
 
+    let json_cfg = JsonConfig::default()
+        // limit request payload size
+        .limit(1048576)
+        // only accept text/plain content type
+        .content_type(|mime| mime == mime::TEXT_PLAIN || mime == mime::APPLICATION_JSON)
+        // use custom error handler
+        .error_handler(|err, req| {
+            info!("Json decoding Err is {:?} req is {:?}", err, req);
+            InternalError::from_response(err, HttpResponse::Conflict().into()).into()
+        });
+
     HttpServer::new(move || {
         App::new()
             .service(handle_log_payload)
             .service(handle_compressed_log_payload)
+            .app_data(json_cfg.clone())
     })
     .bind_rustls(&ARGS.flag_bind, config)?
-    .workers(4)
+    .workers(32)
     .run()
     .await?;
     Ok(())
