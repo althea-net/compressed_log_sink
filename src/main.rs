@@ -8,9 +8,9 @@ extern crate env_logger;
 use actix_web::error::InternalError;
 use actix_web::post;
 use actix_web::web::JsonConfig;
+use actix_web::HttpServer;
 use actix_web::{web::Json, Responder};
 use actix_web::{App, HttpResponse};
-use actix_web::{Error, HttpServer};
 use flate2::read::ZlibDecoder;
 use rustls::{
     internal::pemfile::{certs, pkcs8_private_keys},
@@ -20,8 +20,20 @@ use serde_json::Error as SerdeError;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::net::TcpStream;
+use std::sync::Arc;
+use std::sync::RwLock;
+use std::thread;
+use std::thread::sleep;
+use std::time::Duration;
 use std::{fs::File, io};
 use std::{fs::OpenOptions, io::BufReader};
+
+lazy_static! {
+    /// This log buffer allows us to maintain a steady stream of logs into the logging server
+    /// rather than paying for the connection overhead and write out time for every connection
+    /// potentially causing the writer on the other end to time out or generally have issues
+    static ref LOG_BUFFER: Arc<RwLock<Vec<String>>> = Arc::new(RwLock::new(Vec::new()));
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct PlaintextLogs {
@@ -37,7 +49,8 @@ struct CompressedLogs {
 #[post("/sink")]
 async fn handle_log_payload(value: Json<PlaintextLogs>) -> impl Responder {
     let logs = value.into_inner().logs;
-    output_logs(logs).await
+    LOG_BUFFER.write().unwrap().extend(logs);
+    HttpResponse::Ok().finish()
 }
 
 /// Handler for requests
@@ -52,14 +65,21 @@ async fn handle_compressed_log_payload(request: Json<CompressedLogs>) -> impl Re
         Ok(_) => {
             let plaintext_logs: Result<PlaintextLogs, SerdeError> = serde_json::from_slice(&ret);
             match plaintext_logs {
-                Ok(pl) => output_logs(pl.logs).await,
+                Ok(pl) => {
+                    info!("Got {} lines", pl.logs.len());
+                    LOG_BUFFER.write().unwrap().extend(pl.logs);
+                    HttpResponse::Ok().finish()
+                }
                 Err(e) => {
                     error!("Failed to extract logs {:?}", e);
-                    Ok(HttpResponse::BadRequest().json("Failed to decompress!"))
+                    HttpResponse::BadRequest().json("Failed to decompress!")
                 }
             }
         }
-        Err(e) => Err(e.into()),
+        Err(e) => {
+            error!("Failed to decompress logs {:?}", e);
+            HttpResponse::BadRequest().json("Failed to decompress!")
+        }
     }
 }
 
@@ -118,14 +138,13 @@ fn log_to_bytes(logs: Vec<String>) -> Vec<u8> {
 
 /// Takes the raw log lines from log input handlers and puts them out on the correct output
 /// The options for output are either - for stdout, a file path, or a url for direct tcp log dump
-async fn output_logs(logs: Vec<String>) -> Result<HttpResponse, Error> {
+fn output_logs(logs: Vec<String>) {
     let destination = get_destination_details();
     match destination {
         DestinationType::StdOut => {
             for log in logs {
                 println!("{}", log);
             }
-            Ok(HttpResponse::Ok().json(()))
         }
         DestinationType::File { path } => {
             let bytes = log_to_bytes(logs);
@@ -133,22 +152,29 @@ async fn output_logs(logs: Vec<String>) -> Result<HttpResponse, Error> {
             let mut options = OpenOptions::new();
             let mut file = options
                 .append(true)
-                .open(path)
+                .open(path.clone())
                 .expect("Failed to open file for append");
-            let res = file.write(&bytes);
-            if res.is_err() {
-                return Ok(HttpResponse::InternalServerError().json(()));
+            if let Err(e) = file.write(&bytes) {
+                error!("Failed to write to file {:?} with {:?}", path, e);
             }
-            Ok(HttpResponse::Ok().json(()))
         }
         DestinationType::TCPStream { url } => {
             let bytes = log_to_bytes(logs);
             let socket: SocketAddr = url.parse().expect("Invalid tcp sink socket");
             info!("Dumping {} bytes of logs to {}", bytes.len(), url);
 
-            let mut stream = TcpStream::connect(&socket)?;
-            let _ = stream.write_all(&bytes);
-            Ok(HttpResponse::Ok().json(()))
+            let stream = TcpStream::connect(&socket);
+
+            match stream {
+                Ok(mut stream) => {
+                    if let Err(e) = stream.write_all(&bytes) {
+                        error!("Failed to socket{:?} with {:?}", socket, e);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to connect to socket {:?} with {:?}", socket, e);
+                }
+            }
         }
     }
 }
@@ -213,7 +239,7 @@ async fn main() -> std::io::Result<()> {
 
     let json_cfg = JsonConfig::default()
         // limit request payload size
-        .limit(1048576)
+        .limit(2usize.pow(25))
         // only accept text/plain content type
         .content_type(|mime| mime == mime::TEXT_PLAIN || mime == mime::APPLICATION_JSON)
         // use custom error handler
@@ -221,6 +247,19 @@ async fn main() -> std::io::Result<()> {
             info!("Json decoding Err is {:?} req is {:?}", err, req);
             InternalError::from_response(err, HttpResponse::Conflict().into()).into()
         });
+
+    // this thread buffers logging output and aggregates into a single tcpstream on the
+    // output end, reducing load and load variability on the logging server
+    thread::spawn(move || loop {
+        let mut logs = LOG_BUFFER.write().unwrap();
+        let out_logs = logs.clone();
+        logs.clear();
+        drop(logs);
+        if !out_logs.is_empty() {
+            output_logs(out_logs);
+        }
+        sleep(Duration::from_secs(5));
+    });
 
     HttpServer::new(move || {
         App::new()
