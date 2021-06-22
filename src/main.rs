@@ -6,6 +6,7 @@ extern crate serde_derive;
 extern crate lazy_static;
 extern crate env_logger;
 use actix_web::error::InternalError;
+use actix_web::middleware::NormalizePath;
 use actix_web::post;
 use actix_web::web::JsonConfig;
 use actix_web::HttpServer;
@@ -263,6 +264,7 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(move || {
         App::new()
+            .wrap(NormalizePath::default())
             .service(handle_log_payload)
             .service(handle_compressed_log_payload)
             .app_data(json_cfg.clone())
