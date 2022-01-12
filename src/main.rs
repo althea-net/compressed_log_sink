@@ -8,25 +8,22 @@ extern crate env_logger;
 use actix_web::error::InternalError;
 use actix_web::middleware::NormalizePath;
 use actix_web::post;
-use actix_web::web::JsonConfig;
+use actix_web::web::{JsonConfig, PayloadConfig};
 use actix_web::HttpServer;
 use actix_web::{web::Json, Responder};
 use actix_web::{App, HttpResponse};
 use flate2::read::ZlibDecoder;
-use rustls::{
-    internal::pemfile::{certs, pkcs8_private_keys},
-    NoClientAuth, ServerConfig,
-};
+use rustls::ServerConfig;
 use serde_json::Error as SerdeError;
+use std::io;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
-use std::{fs::File, io};
+use std::{fs, thread};
 use std::{fs::OpenOptions, io::BufReader};
 
 lazy_static! {
@@ -227,20 +224,17 @@ async fn main() -> std::io::Result<()> {
     create_output_file();
     check_tcp_arg();
 
-    let mut config = ServerConfig::new(NoClientAuth::new());
-    let cert_file = &mut BufReader::new(
-        File::open(&ARGS.flag_cert).expect("Invalid ssl certificate! Please use PEM format"),
-    );
-    let key_file = &mut BufReader::new(
-        File::open(&ARGS.flag_key).expect("Invalid ssl private key! Please use PEM format"),
-    );
-    let cert_chain = certs(cert_file).unwrap();
-    let mut keys = pkcs8_private_keys(key_file).unwrap();
-    config.set_single_cert(cert_chain, keys.remove(0)).unwrap();
+    let cert_chain = load_certs(&ARGS.flag_cert);
+    let keys = load_private_key(&ARGS.flag_key);
+    let config = ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, keys)
+        .unwrap();
 
     let json_cfg = JsonConfig::default()
         // limit request payload size
-        .limit(2usize.pow(25))
+        .limit(2usize.pow(32))
         // only accept text/plain content type
         .content_type(|mime| mime == mime::TEXT_PLAIN || mime == mime::APPLICATION_JSON)
         // use custom error handler
@@ -248,6 +242,7 @@ async fn main() -> std::io::Result<()> {
             info!("Json decoding Err is {:?} req is {:?}", err, req);
             InternalError::from_response(err, HttpResponse::Conflict().into()).into()
         });
+    let payload_cfg = PayloadConfig::default().limit(2usize.pow(25));
 
     // this thread buffers logging output and aggregates into a single tcpstream on the
     // output end, reducing load and load variability on the logging server
@@ -268,10 +263,40 @@ async fn main() -> std::io::Result<()> {
             .service(handle_log_payload)
             .service(handle_compressed_log_payload)
             .app_data(json_cfg.clone())
+            .app_data(payload_cfg.clone())
     })
     .bind_rustls(&ARGS.flag_bind, config)?
     .workers(32)
     .run()
     .await?;
     Ok(())
+}
+
+fn load_private_key(filename: &str) -> rustls::PrivateKey {
+    let keyfile = fs::File::open(filename).expect("cannot open private key file");
+    let mut reader = BufReader::new(keyfile);
+
+    loop {
+        match rustls_pemfile::read_one(&mut reader).expect("cannot parse private key .pem file") {
+            Some(rustls_pemfile::Item::RSAKey(key)) => return rustls::PrivateKey(key),
+            Some(rustls_pemfile::Item::PKCS8Key(key)) => return rustls::PrivateKey(key),
+            None => break,
+            _ => {}
+        }
+    }
+
+    panic!(
+        "no keys found in {:?} (encrypted keys not supported)",
+        filename
+    );
+}
+
+fn load_certs(filename: &str) -> Vec<rustls::Certificate> {
+    let certfile = fs::File::open(filename).expect("cannot open certificate file");
+    let mut reader = BufReader::new(certfile);
+    rustls_pemfile::certs(&mut reader)
+        .unwrap()
+        .iter()
+        .map(|v| rustls::Certificate(v.clone()))
+        .collect()
 }
