@@ -26,6 +26,9 @@ use std::time::Duration;
 use std::{fs, thread};
 use std::{fs::OpenOptions, io::BufReader};
 
+/// maximum number of logs allowed in the buffer
+const BUFFER_MAX: usize = 1_000_000;
+
 lazy_static! {
     /// This log buffer allows us to maintain a steady stream of logs into the logging server
     /// rather than paying for the connection overhead and write out time for every connection
@@ -47,8 +50,13 @@ struct CompressedLogs {
 #[post("/sink")]
 async fn handle_log_payload(value: Json<PlaintextLogs>) -> impl Responder {
     let logs = value.into_inner().logs;
-    LOG_BUFFER.write().unwrap().extend(logs);
-    HttpResponse::Ok().finish()
+    let mut buffer = LOG_BUFFER.write().unwrap();
+    if buffer.len() > BUFFER_MAX {
+        HttpResponse::InternalServerError().json("Too many logs in buffer!")
+    } else {
+        buffer.extend(logs);
+        HttpResponse::Ok().finish()
+    }
 }
 
 /// Handler for requests
@@ -65,8 +73,13 @@ async fn handle_compressed_log_payload(request: Json<CompressedLogs>) -> impl Re
             match plaintext_logs {
                 Ok(pl) => {
                     info!("Got {} lines", pl.logs.len());
-                    LOG_BUFFER.write().unwrap().extend(pl.logs);
-                    HttpResponse::Ok().finish()
+                    let mut buffer = LOG_BUFFER.write().unwrap();
+                    if buffer.len() > BUFFER_MAX {
+                        HttpResponse::InternalServerError().json("Too many logs in buffer!")
+                    } else {
+                        buffer.extend(pl.logs);
+                        HttpResponse::Ok().finish()
+                    }
                 }
                 Err(e) => {
                     error!("Failed to extract logs {:?}", e);
@@ -254,7 +267,7 @@ async fn main() -> std::io::Result<()> {
         if !out_logs.is_empty() {
             output_logs(out_logs);
         }
-        sleep(Duration::from_secs(5));
+        sleep(Duration::from_secs(10));
     });
 
     HttpServer::new(move || {
