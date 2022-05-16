@@ -272,7 +272,9 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(move || {
         App::new()
-            .wrap(NormalizePath::default())
+            .wrap(NormalizePath::new(
+                actix_web::middleware::TrailingSlash::Trim,
+            ))
             .service(handle_log_payload)
             .service(handle_compressed_log_payload)
             .app_data(json_cfg.clone())
