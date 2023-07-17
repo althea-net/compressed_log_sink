@@ -15,6 +15,7 @@ use actix_web::{App, HttpResponse};
 use flate2::read::ZlibDecoder;
 use rustls::ServerConfig;
 use serde_json::Error as SerdeError;
+use std::collections::HashSet;
 use std::io;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -71,8 +72,15 @@ async fn handle_compressed_log_payload(request: Json<CompressedLogs>) -> impl Re
         Ok(_) => {
             let plaintext_logs: Result<PlaintextLogs, SerdeError> = serde_json::from_slice(&ret);
             match plaintext_logs {
-                Ok(pl) => {
+                Ok(mut pl) => {
                     info!("Got {} lines", pl.logs.len());
+
+                    // filter all duplicate lines
+                    let set: HashSet<_> = pl.logs.drain(..).collect();
+                    pl.logs.extend(set.into_iter());
+
+                    info!("Filtered down to {} lines", pl.logs.len());
+
                     let mut buffer = LOG_BUFFER.write().unwrap();
                     if buffer.len() > BUFFER_MAX {
                         HttpResponse::InternalServerError().json("Too many logs in buffer!")
