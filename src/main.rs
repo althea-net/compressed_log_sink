@@ -10,6 +10,7 @@ use actix_web::HttpServer;
 use actix_web::{post, web};
 use actix_web::{web::Json, Responder};
 use actix_web::{App, HttpResponse};
+use clap::Parser;
 use crossbeam::queue::SegQueue;
 use flate2::read::ZlibDecoder;
 use rustls::ServerConfig;
@@ -66,7 +67,7 @@ async fn handle_compressed_log_payload(
                 Ok(mut pl) => {
                     info!("Got {} lines", pl.logs.len());
 
-                    if data.0.flag_deupe {
+                    if data.0.dedupe {
                         // filter all duplicate lines
                         let set: HashSet<_> = pl.logs.drain(..).collect();
                         pl.logs.extend(set.into_iter());
@@ -90,6 +91,33 @@ async fn handle_compressed_log_payload(
     }
 }
 
+/// Dedupes logs excluding specific keywords, this is a hack
+/// to avoid deduping logs that would mess up downstream computations
+/// in reality we should modify the routers not to send such repetitive logs
+pub fn dedupe_logs(pl: Vec<String>) -> Vec<String> {
+    let mut output = Vec::new();
+    let mut set = HashSet::new();
+    for line in pl {
+        if contains_filter_keyword(&line) {
+            output.push(line);
+        } else {
+            set.insert(line);
+        }
+    }
+    output.extend(set.into_iter());
+    output
+}
+
+pub fn contains_filter_keyword(input: &str) -> bool {
+    let filter_keywords = vec!["bytes"];
+    for keyword in filter_keywords {
+        if input.contains(keyword) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Enum of possible log output destinations
 pub enum DestinationType {
     StdOut,
@@ -100,7 +128,7 @@ pub enum DestinationType {
 /// Helper function for converting the destination argument string into a DestinationType enum
 /// value
 fn get_destination_details(args: Args) -> DestinationType {
-    match args.flag_output.clone() {
+    match args.output.clone() {
         Some(destination) => {
             if destination.contains(':') && !destination.starts_with('/') {
                 DestinationType::TCPStream { url: destination }
@@ -186,39 +214,28 @@ fn output_logs(logs: Vec<String>, args: Args) {
     }
 }
 
-use docopt::Docopt;
-
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Parser, Debug, Clone)]
+#[command(version, about = "A compressed log sink server", long_about = None)]
 pub struct Args {
-    flag_bind: String,
-    flag_cert: String,
-    flag_key: String,
-    flag_output: Option<String>,
-    flag_deupe: bool,
-}
+    /// Bind to address
+    #[arg(long, default_value = "0.0.0.0:9999")]
+    bind: String,
 
-fn get_usage() -> String {
-    format!(
-        "
-Compressed log sink.
+    /// Https certificate chain
+    #[arg(long)]
+    cert: String,
 
-Usage:
-  compressed_log_sink --bind=<address> --cert=<cert-path> --key=<key-path> --dedupe=<bool> [ --output=<stream> ]
-  compressed_log_sink (-h | --help)
-  compressed_log_sink --version
+    /// Https keyfile
+    #[arg(long)]
+    key: String,
 
-Options:
-  -h --help     Show this screen.
-  --version     Show version.
-  --bind=<address>  Bind to address [default: 0.0.0.0:9999].
-  --output=<stream>  Output stream [default: stdout].
-  --cert=<path>     Https certificate chain.
-  --key=<path>     Https keyfile.
-  --dedupe=<bool>  Remove duplicate lines from logs. True or False.  Default: False
-About:
-    Version {}",
-        env!("CARGO_PKG_VERSION"),
-    )
+    /// Output stream
+    #[arg(long, default_value = "stdout")]
+    output: Option<String>,
+
+    /// Remove duplicate lines from logs
+    #[arg(long)]
+    dedupe: bool,
 }
 
 #[actix_rt::main]
@@ -226,16 +243,14 @@ async fn main() -> std::io::Result<()> {
     env_logger::init();
     openssl_probe::init_ssl_cert_env_vars();
 
-    let args: Args = Docopt::new((get_usage()).as_str())
-        .and_then(|d| d.deserialize())
-        .unwrap_or_else(|e| e.exit());
+    let args = Args::parse();
 
     info!("Compressed log sink starting!");
     create_output_file(args.clone());
     check_tcp_arg(args.clone());
 
-    let cert_chain = load_certs(&args.flag_cert);
-    let keys = load_private_key(&args.flag_key);
+    let cert_chain = load_certs(&args.cert);
+    let keys = load_private_key(&args.key);
     let config = ServerConfig::builder()
         .with_safe_defaults()
         .with_no_client_auth()
@@ -295,7 +310,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(payload_cfg.clone())
             .app_data(shared_data.clone())
     })
-    .bind_rustls(&args.flag_bind, config)?
+    .bind_rustls(&args.bind, config)?
     .run()
     .await?;
     Ok(())
